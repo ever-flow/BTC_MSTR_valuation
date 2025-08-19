@@ -1,0 +1,289 @@
+
+import warnings, math, numpy as np, pandas as pd, yfinance as yf, matplotlib.pyplot as plt
+from sklearn.metrics import r2_score, mean_squared_error
+from sklearn.linear_model import HuberRegressor
+from datetime import timedelta
+
+# ---- 한글 폰트(선택) ----
+try:
+    import koreanize_matplotlib  # noqa
+except Exception:
+    pass
+
+from IPython.display import display
+
+# =========================
+# 설정값
+# =========================
+START = "2021-01-01"
+AUTO_ADJUST = True
+OOS_HORIZONS = (90, 180, 365)
+# 사용자가 요청한 값을 포함하여 시나리오 레벨 업데이트
+SCENARIO_LEVELS = [30_000, 75_000, 100_000, 120_000, 150_000, 200_000, 300_000]
+ROLLING_WIN = 180       # 동적 파라미터 및 롤링 베타 계산용 윈도우
+THRESHOLD_Z = 1.5       # 동적 임계값 Z-score (1.5: 약 86% 신뢰구간)
+SEED = 42
+np.random.seed(SEED)
+pd.options.display.float_format = lambda x: f"{x:,.2f}"
+
+# =========================
+# 데이터 로드/정리
+# =========================
+def prep(df, col):
+    out = pd.DataFrame({"date": df.index, col: df["Close"].squeeze()})
+    out["date"] = pd.to_datetime(out["date"]).dt.tz_localize(None).dt.normalize()
+    out = out.drop_duplicates(subset="date", keep="last")
+    out[col] = pd.to_numeric(out[col], errors="coerce")
+    return out
+
+def load_ohlc_daily(start=START, auto_adjust=AUTO_ADJUST):
+    btc = yf.download("BTC-USD", start=start, auto_adjust=auto_adjust, progress=False)
+    mst = yf.download("MSTR",    start=start, auto_adjust=auto_adjust, progress=False)
+    btc_ = prep(btc, "BTC"); mst_ = prep(mst, "MSTR")
+    df = (pd.merge(btc_, mst_, on="date", how="inner").sort_values("date").dropna())
+    df = df[(df["BTC"] > 0) & (df["MSTR"] > 0)].copy()
+    if len(df) < 10:
+        raise SystemExit("⚠️ 표본이 너무 적습니다.")
+    df["lnx"] = np.log(df["BTC"].to_numpy(float))
+    df["lny"] = np.log(df["MSTR"].to_numpy(float))
+    return df
+
+df = load_ohlc_daily()
+
+# =========================
+# 현재가(라이브) 안전 취득
+# =========================
+def safe_live_close(ticker, auto_adjust=AUTO_ADJUST):
+    try:
+        hist = yf.Ticker(ticker).history(period="1d", interval="1m", auto_adjust=auto_adjust)
+        if hist is not None and not hist.empty:
+            val = hist["Close"].dropna().iloc[-1]
+            if np.isfinite(val): return float(val), "live(1m)"
+    except Exception: pass
+    try:
+        d = yf.download(ticker, period="5d", interval="1d", auto_adjust=auto_adjust, progress=False)
+        val = float(d["Close"].dropna().iloc[-1])
+        return val, "daily_close"
+    except Exception:
+        col = "BTC" if "BTC" in ticker.upper() else "MSTR"
+        return float(df[col].iloc[-1]), "fallback_df"
+
+btc_now, btc_src = safe_live_close("BTC-USD", auto_adjust=AUTO_ADJUST)
+mstr_now, mstr_src = safe_live_close("MSTR", auto_adjust=AUTO_ADJUST)
+
+# =========================
+# ECM 모듈 (HuberRegressor 적용 및 성능지표 추가)
+# =========================
+def longrun_robust_fit(lnx, lny):
+    """ OLS 대신 HuberRegressor를 사용하여 이상치에 강건한 장기 관계 추정 """
+    X = lnx.reshape(-1, 1)
+    huber = HuberRegressor().fit(X, lny)
+    ln_a = huber.intercept_
+    b = huber.coef_[0]
+    resid = lny - (ln_a + b * lnx)
+    sigma_in = float(np.std(resid, ddof=1))
+    return float(ln_a), float(b), resid, sigma_in
+
+def get_rolling_longrun_params(lnx, lny, win=ROLLING_WIN):
+    """ 롤링 윈도우 기반의 가장 최신 장기 파라미터(ln_a, b)를 반환 """
+    lnx_win, lny_win = lnx[-win:], lny[-win:]
+    ln_a_roll, b_roll, _, _ = longrun_robust_fit(lnx_win, lny_win)
+    return ln_a_roll, b_roll
+
+def ecm_fit(lnx_tr, lny_tr):
+    # 1. 장기 모델 적합 및 성능 평가
+    ln_a, b, resid, sigma_long = longrun_robust_fit(lnx_tr, lny_tr)
+    lny_fit_long = ln_a + b * lnx_tr
+    r2_long = r2_score(lny_tr, lny_fit_long)
+    rmse_long = np.sqrt(mean_squared_error(lny_tr, lny_fit_long))
+
+    # 2. 단기 모델 적합 및 성능 평가
+    dly = np.diff(lny_tr); dlx = np.diff(lnx_tr); s_lag = resid[:-1]
+    Z = np.vstack([s_lag, dlx]).T
+    phi, beta = np.linalg.lstsq(Z, dly, rcond=None)[0]
+    dly_fit_short = phi * s_lag + beta * dlx
+    r2_short = r2_score(dly, dly_fit_short)
+
+    # 3. 전체 ECM 모델의 인샘플 예측 성능
+    lny_hat_ecm = [lny_tr[0]]
+    for t in range(1, len(lny_tr)):
+        dly_hat = phi * s_lag[t - 1] + beta * dlx[t - 1]
+        lny_hat_ecm.append(lny_hat_ecm[-1] + dly_hat)
+    lny_hat_ecm = np.array(lny_hat_ecm)
+    r2_ecm_total = r2_score(lny_tr, lny_hat_ecm)
+    rmse_ecm_total = np.sqrt(mean_squared_error(lny_tr, lny_hat_ecm))
+
+    return {
+        "longrun": {"ln_a": ln_a, "b": b},
+        "shortrun": {"phi": float(phi), "beta": float(beta)},
+        "performance": {
+            "long_R2": r2_long, "long_RMSE": rmse_long,
+            "short_R2": r2_short,
+            "ecm_total_R2": r2_ecm_total, "ecm_total_RMSE": rmse_ecm_total
+        }
+    }
+
+# =========================
+# 전체 데이터 재학습 및 파라미터 추출
+# =========================
+lnx_full, lny_full = df["lnx"].to_numpy(float), df["lny"].to_numpy(float)
+
+# 1. (Static) 전체 기간 기준 파라미터 -> 역사적 프리미엄 및 벤치마크용
+params_full_static = ecm_fit(lnx_full, lny_full)
+ln_a_static, b_static = params_full_static["longrun"]["ln_a"], params_full_static["longrun"]["b"]
+phi, beta = params_full_static["shortrun"]["phi"], params_full_static["shortrun"]["beta"]
+performance_metrics = params_full_static["performance"]
+
+# 2. (Dynamic) 롤링 기간 기준 최신 파라미터 -> '현재' 공정가치 계산용
+ln_a_dynamic, b_dynamic = get_rolling_longrun_params(lnx_full, lny_full, win=ROLLING_WIN)
+
+# =========================
+# 공정가 & 프리미엄 계산
+# =========================
+mstr_fv_static = float(np.exp(ln_a_static + b_static * np.log(btc_now)))
+prem_static = (mstr_now / mstr_fv_static) - 1.0
+mstr_fv_dynamic = float(np.exp(ln_a_dynamic + b_dynamic * np.log(btc_now)))
+prem_dynamic = (mstr_now / mstr_fv_dynamic) - 1.0
+
+# =========================
+# 동적 임계값(매수/매도 존) 계산
+# =========================
+fv_series_static = np.exp(ln_a_static + b_static * lnx_full)
+premium_series = (df["MSTR"].to_numpy(float) / fv_series_static) - 1.0
+prem_roll_mean = pd.Series(premium_series).rolling(window=ROLLING_WIN).mean().iloc[-1]
+prem_roll_std = pd.Series(premium_series).rolling(window=ROLLING_WIN).std().iloc[-1]
+buy_threshold = prem_roll_mean - (THRESHOLD_Z * prem_roll_std)
+sell_threshold = prem_roll_mean + (THRESHOLD_Z * prem_roll_std)
+
+def get_current_zone(premium, buy_thresh, sell_thresh):
+    if premium <= buy_thresh: return f"매수 고려 Zone (≤ {buy_thresh:.2%})"
+    if premium >= sell_thresh: return f"매도 고려 Zone (≥ {sell_thresh:.2%})"
+    return f"중립 Zone ({buy_thresh:.2%} ~ {sell_thresh:.2%})"
+current_zone = get_current_zone(prem_dynamic, buy_threshold, sell_threshold)
+
+# =========================
+# 요약 리포트
+# =========================
+summary_data = {
+    "구분": ["현재 가격", "공정가치 (FV)", "프리미엄", "현재 상태"],
+    "정적 모델 (Static)": [
+        f"${mstr_now:,.2f}", f"${mstr_fv_static:,.2f} (b={b_static:.3f})",
+        f"{prem_static:.2%}", "-"
+    ],
+    "동적 모델 (Dynamic)": [
+        f"${mstr_now:,.2f}", f"${mstr_fv_dynamic:,.2f} (b={b_dynamic:.3f})",
+        f"{prem_dynamic:.2%}", current_zone
+    ]
+}
+summary_df = pd.DataFrame(summary_data)
+print("===== 현재 시점 MSTR 가치평가 요약 =====")
+print(f"BTC 현재가: ${btc_now:,.2f} ({btc_src})")
+display(summary_df)
+print(f"\n[해석] 동적 모델 기준, 현재 MSTR 프리미엄({prem_dynamic:.2%})은(는) '{current_zone}'에 위치합니다.")
+print(f"* 동적 임계값: Z-score={THRESHOLD_Z}, Rolling Window={ROLLING_WIN}일 기준")
+print("* 정적 모델: 전체 기간(2021년~)의 평균 관계. 구조적 위치 파악용.")
+print("* 동적 모델: 최근 180일의 시장 관계. 현재 시점의 매매 판단용.")
+
+# =========================
+# BTC 가격 시나리오별 MSTR 주가 추정 (요청에 의해 추가된 부분)
+# =========================
+scenario_data = []
+for btc_target in SCENARIO_LEVELS:
+    ln_btc_target = np.log(btc_target)
+    # 정적 모델(전체 기간) 기반 MSTR 가격 추정
+    mstr_pred_static = float(np.exp(ln_a_static + b_static * ln_btc_target))
+    # 동적 모델(최근 180일) 기반 MSTR 가격 추정
+    mstr_pred_dynamic = float(np.exp(ln_a_dynamic + b_dynamic * ln_btc_target))
+    scenario_data.append({
+        "BTC 시나리오 가격": f"${btc_target:,.0f}",
+        "MSTR 예상가 (정적 모델)": f"${mstr_pred_static:,.2f}",
+        "MSTR 예상가 (동적 모델)": f"${mstr_pred_dynamic:,.2f}"
+    })
+
+scenario_df = pd.DataFrame(scenario_data)
+print("\n===== BTC 가격 시나리오별 MSTR 공정가치 추정 =====")
+display(scenario_df)
+print("* 위 추정치는 현재 모델의 파라미터(b)가 미래에도 유지된다는 가정 하의 이론적 가격입니다.")
+print("* 정적 모델은 장기적(2021년~) 관계를, 동적 모델은 단기적(최근 180일) 시장 관계를 반영합니다.")
+
+
+# =========================
+# 모델 성능 리포트 (신규 추가)
+# =========================
+perf_data = {
+    "모델 구분": ["장기 관계 (ln(MSTR) ~ ln(BTC))", "단기 동학 (Δln(MSTR) ~ error, Δln(BTC))", "전체 ECM (ln(MSTR))"],
+    "설명력 (R²)": [
+        f"{performance_metrics['long_R2']:.3f}",
+        f"{performance_metrics['short_R2']:.3f}",
+        f"{performance_metrics['ecm_total_R2']:.3f}"
+    ],
+    "로그 오차 (RMSE)": [
+        f"{performance_metrics['long_RMSE']:.4f}",
+        "-",
+        f"{performance_metrics['ecm_total_RMSE']:.4f}"
+    ]
+}
+perf_df = pd.DataFrame(perf_data)
+print("\n===== 전체 기간(Static) 모델 성능 지표 =====")
+display(perf_df)
+print("* R²(설명력): 1에 가까울수록 모델이 데이터를 잘 설명함.")
+print("* RMSE(로그 오차): 0에 가까울수록 모델의 예측 오차가 적음.")
+
+
+# =========================
+# 시각화 (기존과 동일)
+# =========================
+# 1. 장기 관계 산점도 (정적 모델 기준)
+a_static = float(np.exp(ln_a_static))
+x_grid = np.linspace(df["BTC"].min(), df["BTC"].max(), 400)
+y_fit = a_static * np.power(x_grid, b_static)
+plt.figure(figsize=(10, 8))
+plt.scatter(df["BTC"], df["MSTR"], s=12, alpha=0.6, label="관측치")
+plt.plot(x_grid, y_fit, "r-", lw=2.0, label=f"장기 강건회귀선 (전체 기간)\ny={a_static:.2e}·x^{b_static:.4f}")
+plt.xscale("log"); plt.yscale("log")
+plt.xlabel("BTC (USD, 로그)"); plt.ylabel("MSTR (USD, 로그)")
+plt.title("MSTR vs BTC (산점 + 장기 공정선)")
+plt.grid(True, which="both", ls="--", alpha=0.35); plt.legend(); plt.tight_layout(); plt.show()
+
+# 2. 롤링 베타 (탄력도 'b'의 시계열 변화)
+def plot_rolling_beta(df, win=ROLLING_WIN, b_all_static=None, b_all_dynamic=None):
+    lnx, lny = df["lnx"].to_numpy(float), df["lny"].to_numpy(float)
+    dates = pd.to_datetime(df["date"]).to_numpy()
+    betas, ts = [], []
+    for i in range(win, len(lnx)):
+        xw, yw = lnx[i-win:i], lny[i-win:i]
+        _, b_win, _, _ = longrun_robust_fit(xw, yw)
+        betas.append(b_win); ts.append(dates[i])
+    plt.figure(figsize=(10, 4))
+    plt.plot(ts, betas, lw=1.5, label=f"롤링 {win}일 b_t")
+    if b_all_static is not None:
+        plt.axhline(b_all_static, color='r', ls='--', lw=1.2, alpha=0.7, label=f"전체(정적) b={b_all_static:.3f}")
+    if b_all_dynamic is not None:
+        plt.axhline(b_all_dynamic, color='g', ls='--', lw=1.2, alpha=0.7, label=f"최근(동적) b={b_all_dynamic:.3f}")
+    plt.title(f"롤링 {win}일 탄력도(b) 변화 추이")
+    plt.grid(True, alpha=0.3); plt.legend(); plt.tight_layout(); plt.show()
+
+plot_rolling_beta(df, win=ROLLING_WIN, b_all_static=b_static, b_all_dynamic=b_dynamic)
+
+# 3. 프리미엄 시계열과 동적 임계 밴드
+fv_df = pd.DataFrame({
+    "date": pd.to_datetime(df["date"]),
+    "premium": premium_series * 100.0 # % 단위로
+})
+fv_df["roll_mean"] = fv_df["premium"].rolling(window=ROLLING_WIN).mean()
+fv_df["roll_std"] = fv_df["premium"].rolling(window=ROLLING_WIN).std()
+fv_df["upper_band"] = fv_df["roll_mean"] + (THRESHOLD_Z * fv_df["roll_std"])
+fv_df["lower_band"] = fv_df["roll_mean"] - (THRESHOLD_Z * fv_df["roll_std"])
+
+plt.figure(figsize=(11, 5))
+plt.plot(fv_df["date"], fv_df["premium"], lw=1.5, alpha=0.7, label="프리미엄(%)")
+plt.plot(fv_df["date"], fv_df["upper_band"], 'r--', lw=1.0, label=f"매도 고려 Zone (Mean + {THRESHOLD_Z}σ)")
+plt.plot(fv_df["date"], fv_df["lower_band"], 'b--', lw=1.0, label=f"매수 고려 Zone (Mean - {THRESHOLD_Z}σ)")
+plt.axhline(0, lw=1, alpha=0.6, color="k")
+# 현재 프리미엄 위치 표시
+plt.scatter([fv_df["date"].iloc[-1] + timedelta(days=5)], [prem_dynamic * 100],
+            s=50, c='magenta', zorder=5, label=f"현재 프리미엄 ({prem_dynamic:.2%})")
+
+plt.title("프리미엄(%) 시계열과 동적 매매 고려 Zone")
+plt.xlabel("Date"); plt.ylabel("Premium (%)")
+plt.grid(True, alpha=0.3); plt.legend(); plt.tight_layout(); plt.show()
