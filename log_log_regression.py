@@ -1,3 +1,5 @@
+# -*- coding: utf-8 -*-
+# Colab/노트북: 한글 폰트 및 경고 최소화
 !pip -q install koreanize_matplotlib
 
 import warnings, math
@@ -12,16 +14,6 @@ from sklearn.metrics import r2_score, mean_squared_error
 from sklearn.linear_model import HuberRegressor
 from datetime import timedelta
 import koreanize_matplotlib 
-
-
-"""
-MSTR ↔ BTC ECM 강화 모델 v2.3.1 (Lookahead Bias Corrected, Plot/Print Fix)
-- v2.3 대비 개선:
-  1) 한글 글리프 경고 제거(스타일 이후 폰트 재지정), 라벨/범례 한글 고정
-  2) f-string 출력 버그 수정(날짜/윈도우 표시)
-  3) 동적 임계밴드 계산의 수치적 안정성 강화(ddof, 최소표본 체크)
-  4) 코드 정리: 함수 단위/주석 보강 (모델 로직은 동일)
-"""
 
 # =========================
 # 설정값
@@ -240,13 +232,18 @@ print("* RMSE(로그 오차): 0에 가까울수록 모델의 예측 오차가 �
 # 시각화
 # =========================
 # 스타일을 켠 뒤, 폰트가 바뀌지 않도록 다시 폰트 고정
+
 plt.style.use('seaborn-v0_8-whitegrid')
 try:
-    import koreanize_matplotlib  # 재호출로 폰트 재고정
-    plt.rcParams["font.family"] = "Malgun Gothic"
-    plt.rcParams["axes.unicode_minus"] = False
-except Exception:
-    pass
+    import koreanize_matplotlib  # 이미 설치됨
+except ImportError:
+    !pip install koreanize_matplotlib
+    import koreanize_matplotlib
+
+# 직접 폰트 설정 (NanumGothic 사용)
+plt.rc('font', family='NanumGothic')
+plt.rcParams['axes.unicode_minus'] = False  # 마이너스 기호 깨짐 방지
+
 
 fig, axes = plt.subplots(3, 1, figsize=(12, 18))
 fig.suptitle('MSTR-BTC ECM 분석 시각화 (v2.3.1)', fontsize=18, y=0.95)
