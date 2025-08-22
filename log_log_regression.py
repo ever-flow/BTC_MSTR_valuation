@@ -1,3 +1,5 @@
+### BEST (8.21)
+
 # -*- coding: utf-8 -*-
 # Colab/노트북: 한글 폰트 및 경고 최소화
 !pip -q install koreanize_matplotlib
@@ -13,7 +15,7 @@ import matplotlib.pyplot as plt
 from sklearn.metrics import r2_score, mean_squared_error
 from sklearn.linear_model import HuberRegressor
 from datetime import timedelta
-import koreanize_matplotlib 
+import koreanize_matplotlib
 
 # =========================
 # 설정값
